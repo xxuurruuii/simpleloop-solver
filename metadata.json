@@ -1,0 +1,5 @@
+{
+  "name": "Simpleloop Logic Solver",
+  "description": "A logic puzzle solver for Simple Loop puzzles using specific connectivity rules and group theory.",
+  "requestFramePermissions": []
+}
