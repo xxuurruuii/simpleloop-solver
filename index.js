@@ -318,17 +318,12 @@ const applyRules = (currentState) => {
   }
   
   // --- Rule 6: Graph Cut Analysis (Global) ---
-  // Must run before loop prevention to catch forced connections early
-  
-  // Part A: Check for Bridges (1-Cuts) in current graph
-  // If an edge is a bridge, it MUST be SOLID (assuming the loop must visit all nodes in the component)
   const adj = buildAdjacency(rows, cols, currentState.cells, nextHEdges, nextVEdges);
   const bridges = findBridges(rows * cols, adj);
   
   if (bridges.length > 0) {
       let applied = false;
       for (const b of bridges) {
-          // b has { r, c, type }
           let currentVal = (b.type === 'h') ? nextHEdges[b.r][b.c] : nextVEdges[b.r][b.c];
           if (currentVal !== EdgeState.SOLID) {
                if (b.type === 'h') nextHEdges[b.r][b.c] = EdgeState.SOLID;
@@ -339,10 +334,6 @@ const applyRules = (currentState) => {
       if (applied || changed) return finalizeStep();
   }
 
-  // Part B: Check for 2-Cuts (Conditional Bridges)
-  // If removing an EMPTY edge 'e' makes another edge 'b' a bridge, then both 'e' and 'b' must be SOLID.
-  // We scan all EMPTY edges as candidates.
-  
   const candidates = [];
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
@@ -362,20 +353,16 @@ const applyRules = (currentState) => {
   }
 
   for (const cand of candidates) {
-      // Temporarily ignore this edge (effectively marking as CROSS)
       const tempAdj = buildAdjacency(rows, cols, currentState.cells, nextHEdges, nextVEdges, cand);
       const tempBridges = findBridges(rows * cols, tempAdj);
       
       if (tempBridges.length > 0) {
-          // Found a 2-cut involving 'cand' and the found bridges
           let applied = false;
           
-          // Set Candidate to SOLID
           if (cand.type === 'h') nextHEdges[cand.r][cand.c] = EdgeState.SOLID;
           else nextVEdges[cand.r][cand.c] = EdgeState.SOLID;
           applied = true;
           
-          // Set Found Bridges to SOLID
           for (const b of tempBridges) {
               if (b.type === 'h') {
                   if (nextHEdges[b.r][b.c] !== EdgeState.SOLID) {
@@ -389,11 +376,9 @@ const applyRules = (currentState) => {
                   }
               }
           }
-          
           if (applied) return finalizeStep();
       }
   }
-
 
   // --- Rule 3: Loop Prevention ---
   if (distinctComponents > 1) {
@@ -438,19 +423,26 @@ const applyRules = (currentState) => {
       if (!isConnectedNow) {
          const neighborGroups = new Set();
          const neighborGroupCounts = new Map();
+         
+         // Fix: Snapshot neighbor groups BEFORE iterating.
+         // If we iterate and call setEdge(SOLID), nextUf changes, which can confuse subsequent lookups
+         // for other neighbors if groups merge.
+         const neighborGroupIds = new Map(); // neighbor index in validNeighbors -> groupID
 
-         validNeighbors.forEach(n => {
+         validNeighbors.forEach((n, idx) => {
              const nId = getCellId(n.r, n.c);
              const gId = nextUf.find(nId);
+             neighborGroupIds.set(idx, gId);
+             
              neighborGroups.add(gId);
              neighborGroupCounts.set(gId, (neighborGroupCounts.get(gId) || 0) + 1);
          });
 
          if (neighborGroups.size === 2) {
              let applied = false;
-             validNeighbors.forEach(n => {
-                 const nId = getCellId(n.r, n.c);
-                 const root = nextUf.find(nId);
+             validNeighbors.forEach((n, idx) => {
+                 // Use the snapshot group ID, not the live one
+                 const root = neighborGroupIds.get(idx);
                  const groupFrequency = neighborGroupCounts.get(root) || 0;
 
                  if (n.edgeState === EdgeState.EMPTY) {
@@ -460,7 +452,7 @@ const applyRules = (currentState) => {
                      } else {
                          n.setEdge(EdgeState.DASHED);
                          applied = true;
-                     }
+                     } 
                  }
              });
              if (applied || changed) return finalizeStep();
