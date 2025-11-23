@@ -528,8 +528,8 @@ function handleImport() {
         return;
     }
 
-    const r = parseInt(match[1]);
-    const c = parseInt(match[2]);
+    const c = parseInt(match[1]);
+    const r = parseInt(match[2]);
     const data = match[3];
 
     if (isNaN(r) || isNaN(c)) return;
