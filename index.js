@@ -61,10 +61,107 @@ const initializeState = (rows, cols, existingCells) => {
     cells.push(row);
   }
 
+  // Initialize edges
+  // Preprocessing: Mark edges around black cells as CROSS
   const hEdges = Array.from({ length: rows }, () => Array(cols - 1).fill(EdgeState.EMPTY));
   const vEdges = Array.from({ length: rows - 1 }, () => Array(cols).fill(EdgeState.EMPTY));
 
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      if (cells[r][c].isBlack) {
+        // Top
+        if (r > 0) vEdges[r - 1][c] = EdgeState.CROSS;
+        // Bottom
+        if (r < rows - 1) vEdges[r][c] = EdgeState.CROSS;
+        // Left
+        if (c > 0) hEdges[r][c - 1] = EdgeState.CROSS;
+        // Right
+        if (c < cols - 1) hEdges[r][c] = EdgeState.CROSS;
+      }
+    }
+  }
+
   return { rows, cols, cells, hEdges, vEdges, uf };
+};
+
+// Helper: Build Adjacency List for Graph Algorithms
+// Nodes are cell indices (0 to rows*cols - 1)
+// Edges are connections where state is NOT CROSS
+const buildAdjacency = (rows, cols, cells, hEdges, vEdges, ignoreEdge = null) => {
+    const adj = Array.from({ length: rows * cols }, () => []);
+    
+    for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+            if (cells[r][c].isBlack) continue;
+            const u = r * cols + c;
+
+            // Check Right Neighbor
+            if (c < cols - 1) {
+                const isIgnored = ignoreEdge && ignoreEdge.type === 'h' && ignoreEdge.r === r && ignoreEdge.c === c;
+                if (!isIgnored) {
+                    const val = hEdges[r][c];
+                    if (val !== EdgeState.CROSS && !cells[r][c+1].isBlack) {
+                        const v = r * cols + c + 1;
+                        const edgeData = { to: v, r, c, type: 'h' };
+                        adj[u].push(edgeData);
+                        adj[v].push({ to: u, r, c, type: 'h' }); // Undirected
+                    }
+                }
+            }
+            
+            // Check Bottom Neighbor
+            if (r < rows - 1) {
+                const isIgnored = ignoreEdge && ignoreEdge.type === 'v' && ignoreEdge.r === r && ignoreEdge.c === c;
+                if (!isIgnored) {
+                    const val = vEdges[r][c];
+                    if (val !== EdgeState.CROSS && !cells[r+1][c].isBlack) {
+                        const v = (r + 1) * cols + c;
+                        const edgeData = { to: v, r, c, type: 'v' };
+                        adj[u].push(edgeData);
+                        adj[v].push({ to: u, r, c, type: 'v' });
+                    }
+                }
+            }
+        }
+    }
+    return adj;
+};
+
+// Helper: Tarjan's Bridge-Finding Algorithm
+const findBridges = (numNodes, adj) => {
+    const bridges = [];
+    const disc = new Int32Array(numNodes).fill(-1);
+    const low = new Int32Array(numNodes).fill(-1);
+    const parent = new Int32Array(numNodes).fill(-1);
+    let time = 0;
+
+    const dfs = (u) => {
+        disc[u] = low[u] = ++time;
+        
+        for (const edge of adj[u]) {
+            const v = edge.to;
+            if (v === parent[u]) continue;
+            
+            if (disc[v] !== -1) {
+                low[u] = Math.min(low[u], disc[v]);
+            } else {
+                parent[v] = u;
+                dfs(v);
+                low[u] = Math.min(low[u], low[v]);
+                if (low[v] > disc[u]) {
+                    bridges.push(edge);
+                }
+            }
+        }
+    };
+
+    for (let i = 0; i < numNodes; i++) {
+        // Only start DFS if node is part of the graph (has adjacency) and not visited
+        if (adj[i].length > 0 && disc[i] === -1) {
+            dfs(i);
+        }
+    }
+    return bridges;
 };
 
 // Returns a NEW state (deep copyish where needed) and a boolean indicating if changes occurred
@@ -135,6 +232,8 @@ const applyRules = (currentState) => {
       if (dir === 'right') nextHEdges[r][c] = s;
       changed = true;
       
+      // Update UF locally to support rule chaining within the same step if needed,
+      // though major logic relies on the initial UF build.
       if (s === EdgeState.SOLID || s === EdgeState.DASHED) {
          let r2 = r, c2 = c;
          if (dir === 'up') r2 = r - 1;
@@ -148,7 +247,6 @@ const applyRules = (currentState) => {
          const root2 = nextUf.find(id2);
          if (root1 !== root2) {
              nextUf.union(id1, id2);
-             distinctComponents--;
          }
       }
     }
@@ -174,7 +272,6 @@ const applyRules = (currentState) => {
   };
 
   // --- Rule 1: Degree 2 ---
-  // If a cell only has 2 valid neighbors, connect them.
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
       const cell = currentState.cells[r][c];
@@ -200,7 +297,6 @@ const applyRules = (currentState) => {
   }
 
   // --- Rule 2: Max Degree ---
-  // If a cell has 2 Solid lines, cross others.
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
       const cell = currentState.cells[r][c];
@@ -220,9 +316,86 @@ const applyRules = (currentState) => {
       }
     }
   }
+  
+  // --- Rule 6: Graph Cut Analysis (Global) ---
+  // Must run before loop prevention to catch forced connections early
+  
+  // Part A: Check for Bridges (1-Cuts) in current graph
+  // If an edge is a bridge, it MUST be SOLID (assuming the loop must visit all nodes in the component)
+  const adj = buildAdjacency(rows, cols, currentState.cells, nextHEdges, nextVEdges);
+  const bridges = findBridges(rows * cols, adj);
+  
+  if (bridges.length > 0) {
+      let applied = false;
+      for (const b of bridges) {
+          // b has { r, c, type }
+          let currentVal = (b.type === 'h') ? nextHEdges[b.r][b.c] : nextVEdges[b.r][b.c];
+          if (currentVal !== EdgeState.SOLID) {
+               if (b.type === 'h') nextHEdges[b.r][b.c] = EdgeState.SOLID;
+               else nextVEdges[b.r][b.c] = EdgeState.SOLID;
+               applied = true;
+          }
+      }
+      if (applied || changed) return finalizeStep();
+  }
+
+  // Part B: Check for 2-Cuts (Conditional Bridges)
+  // If removing an EMPTY edge 'e' makes another edge 'b' a bridge, then both 'e' and 'b' must be SOLID.
+  // We scan all EMPTY edges as candidates.
+  
+  const candidates = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+        // Horizontal Candidates
+        if (c < cols - 1) {
+            if (nextHEdges[r][c] === EdgeState.EMPTY && !currentState.cells[r][c].isBlack && !currentState.cells[r][c+1].isBlack) {
+                candidates.push({ r, c, type: 'h' });
+            }
+        }
+        // Vertical Candidates
+        if (r < rows - 1) {
+            if (nextVEdges[r][c] === EdgeState.EMPTY && !currentState.cells[r][c].isBlack && !currentState.cells[r+1][c].isBlack) {
+                candidates.push({ r, c, type: 'v' });
+            }
+        }
+    }
+  }
+
+  for (const cand of candidates) {
+      // Temporarily ignore this edge (effectively marking as CROSS)
+      const tempAdj = buildAdjacency(rows, cols, currentState.cells, nextHEdges, nextVEdges, cand);
+      const tempBridges = findBridges(rows * cols, tempAdj);
+      
+      if (tempBridges.length > 0) {
+          // Found a 2-cut involving 'cand' and the found bridges
+          let applied = false;
+          
+          // Set Candidate to SOLID
+          if (cand.type === 'h') nextHEdges[cand.r][cand.c] = EdgeState.SOLID;
+          else nextVEdges[cand.r][cand.c] = EdgeState.SOLID;
+          applied = true;
+          
+          // Set Found Bridges to SOLID
+          for (const b of tempBridges) {
+              if (b.type === 'h') {
+                  if (nextHEdges[b.r][b.c] !== EdgeState.SOLID) {
+                      nextHEdges[b.r][b.c] = EdgeState.SOLID;
+                      applied = true;
+                  }
+              } else {
+                  if (nextVEdges[b.r][b.c] !== EdgeState.SOLID) {
+                      nextVEdges[b.r][b.c] = EdgeState.SOLID;
+                      applied = true;
+                  }
+              }
+          }
+          
+          if (applied) return finalizeStep();
+      }
+  }
+
 
   // --- Rule 3: Loop Prevention ---
-  // If two neighbors belong to the same group but no line (Solid/Dashed) exists, Cross.
   if (distinctComponents > 1) {
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
@@ -250,7 +423,6 @@ const applyRules = (currentState) => {
   }
 
   // --- Rule 4: Bridge/Dashed Logic ---
-  // If not connected to any group, and adjacent groups count == 2
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
       const cell = currentState.cells[r][c];
@@ -298,8 +470,6 @@ const applyRules = (currentState) => {
   }
 
   // --- Rule 5: Single Exit Group Consistency ---
-  // If a cell has exactly 1 Solid line, and all other available neighbors belong to the same group,
-  // mark those neighbors as DASHED.
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
       const cell = currentState.cells[r][c];
@@ -469,6 +639,20 @@ function startSolving() {
     if (!isSolving) {
         isSolving = true;
         toggleInputs(false);
+        // Re-initialize to ensure black cell preprocessing is applied if not already
+        const tempCells = [];
+        for (let r = 0; r < rows; r++) {
+            const row = [];
+            for (let c = 0; c < cols; c++) {
+                row.push({
+                    r, c,
+                    isBlack: blackCells.has(`${r},${c}`),
+                    groupId: r * cols + c
+                });
+            }
+            tempCells.push(row);
+        }
+        solverState = initializeState(rows, cols, tempCells);
     }
 }
 
